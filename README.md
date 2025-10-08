@@ -55,7 +55,7 @@ Built around **VinDr-Mammo**, it (1) preprocesses images, (2) creates **S** and 
 
 ### Derived patch datasets: **S** and **S10**
 - **S (sparse):** Per image, one ROI-centered abnormal patch (224×224) + one background patch  
-- **S10 (dense):** Ten abnormal patches near ROI (20% overlap) + multiple background patches  
+- **S10 (dense):** Ten abnormal patches near ROI (e.g., pos overlap ≥0.90; neg overlap ≤0.20) + multiple background patches  
 - **CSV schema:** `path,label,image_id,split,set` where `set ∈ {S, S10}`  
 - Saved under: `patches/{training|test}/{S|S10}/` with mirrored CSVs
 
