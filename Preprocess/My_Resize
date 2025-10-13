@@ -1,0 +1,88 @@
+import os
+import pandas as pd
+import numpy as np
+from resize_utils import resize_image, image_as_png, segment_breast
+
+
+# 1) Configuration
+home_path   = '/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0'
+CSV_PATH    = os.path.join(home_path, 'finding_annotations.csv')
+HEIGHT_NEW  = 1152
+WIDTH_NEW   = 896
+
+# Derive a dataset name from the CSV filename
+dataset     = 'VinDr-Mammo'
+
+# Where to write resized PNGs and the new manifest
+output_dir  = os.path.join(home_path, f'resized_images_{dataset}')
+os.makedirs(output_dir, exist_ok=True)
+output_csv  = os.path.join(output_dir, 'resized_images_manifest.csv')
+
+
+# 2) Read input CSV
+# used CSV columns: "study_id", "image_id", "breast_birads"
+df = pd.read_csv(CSV_PATH)
+
+# Prepare a list to collect output records
+out_records = []
+
+
+# 3) Loop over each row: build filepath, resize, save
+for idx, row in df.iterrows():
+    study_id = row['study_id']
+    image_id = row['image_id']
+    label    = row['breast_birads']
+    xmin    = row['xmin']
+    ymin    = row['ymin']
+    xmax    = row['xmax']
+    ymax    = row['ymax']
+    split    = row['split']
+
+    # a) Construct the DICOM path
+    img_path = os.path.join(
+            home_path,
+            'images',
+            str(study_id),
+            f"{image_id}.dicom"
+        )
+
+    try:
+        # b) Resize the image 
+        resized, SFactor, TP, BP, LP, RP = resize_image(img_path, HEIGHT_NEW, WIDTH_NEW)
+        # normalize and stretch into 1-bit range
+        r = resized.astype(np.float32)
+        r = (r - r.min()) / (r.max() - r.min())             # now in [0,1]
+        r16 = (r * 65535).astype(np.uint16)                 
+    except Exception as e:
+        print(f"[ERROR] {idx}: failed to resize {img_path}: {e}")
+        continue
+
+
+    # c) Segment the breast region from the resized image
+    resized_image = segment_breast(r16, crop= False)
+
+    # d) Build output filename and save as 16-bit PNG
+    out_name = f"resized_image_{idx}.png"
+    out_path = os.path.join(output_dir, out_name)
+    image_as_png(resized_image, out_path, bitdepth=16)
+    print(f'Resized and segmented image saved as {out_name}')
+    print(f'*********************************************************')
+
+
+    # e) Record for manifest
+    out_records.append({
+        'path':  out_path,
+        'image_id': image_id,
+        'label': label,
+        'xmin': xmin*SFactor + LP,
+        'ymin': ymin*SFactor + TP,
+        'xmax': xmax*SFactor + LP,
+        'ymax': ymax*SFactor + TP,
+        'split': split
+    })
+
+
+# 4) Write the new CSV manifest
+out_df = pd.DataFrame(out_records)
+out_df.to_csv(output_csv, index=False)
+print(f"\nDone! Wrote {len(out_records)} entries to:\n  {output_csv}")
