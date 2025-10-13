@@ -1,0 +1,215 @@
+import os, json, cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import torch
+import torch.nn.functional as F
+from Patch_classifier_utils import initialize_model
+from DeformationUtils import extract_patches, warped_imgs, warped_str
+
+
+# =========================
+#        CONFIG
+# =========================
+device       = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model_name   = "resnet"
+num_classes  = 2
+batch_size   = 64
+patch_size   = 224
+stride       = 32
+
+# PATHS
+weights_dict = '/home/AD/ses235/Documents/My_Project/VinDr_Mamo/saved_models/20percentcutoff.s10.pth'
+image_path = "/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/resized_images_VinDr-Mammo/resized_image_30.png"
+bbox_csv = "/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/resized_images_manifest.csv"  
+norm_json = "saved_models/train_norm.json"
+
+
+# =========================
+#    NORMALIZATION
+# =========================
+fallback_mean, fallback_std = 0.3385, 0.3344
+if os.path.exists(norm_json):
+    with open(norm_json, "r") as f:
+        _s = json.load(f)
+    mean_pixel = float(_s.get("mean", fallback_mean))
+    std_pixel  = float(_s.get("std",  fallback_std))
+else:
+    mean_pixel, std_pixel = fallback_mean, fallback_std
+print(f"[INFO] mean/std used -> {mean_pixel:.6f} / {std_pixel:.6f}")
+
+
+# =========================
+#     MODEL: LOAD WEIGHTS
+# =========================
+model = initialize_model(model_name, num_classes=num_classes, use_pretrained=False).to(device)
+ckpt = torch.load(weights_dict, map_location="cpu")
+state = ckpt.get("model_state_dict", ckpt)
+model.load_state_dict(state, strict=False)
+model.eval()
+print("[OK] Model loaded from:", weights_dict)
+
+
+# =========================
+#        IMAGE I/O
+# =========================
+im = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+if im is None:
+    raise FileNotFoundError(f"Could not read image: {image_path}")
+if im.ndim == 3 and im.shape[2] == 3:
+    im = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+
+# Normalize depending on bit depth
+if im.dtype == np.uint16:
+    im_f01_gray = im.astype(np.float32) / 65535.0
+elif im.dtype == np.uint8:
+    im_f01_gray = im.astype(np.float32) / 255.0
+else:
+    im_f01_gray = np.clip(im.astype(np.float32), 0, 1)
+
+H, W = im_f01_gray.shape
+print(f"[INFO] Image shape={H}x{W} dtype={im.dtype}, float_min/max={im_f01_gray.min():.4f}/{im_f01_gray.max():.4f}")
+
+# Build 3-channel float image in [0,1] for patching
+image_np = np.stack([im_f01_gray, im_f01_gray, im_f01_gray], axis=-1)
+
+
+# =========================
+#   PATCHES + INFERENCE
+# =========================
+def patch_transform(patch_f01_3ch: np.ndarray) -> torch.Tensor:
+    """H×W×3 float[0,1] -> torch.FloatTensor [3,H,W], normalized with scalar mean/std."""
+    x3 = np.transpose(patch_f01_3ch, (2, 0, 1))  # C×H×W
+    x3 = (x3 - mean_pixel) / (std_pixel if std_pixel > 0 else 1.0)
+    return torch.from_numpy(x3).float()
+
+patches = extract_patches(image_np, patch_size, stride)
+N = len(patches)
+print(f"[INFO] patches extracted: {N}")
+
+@torch.no_grad()
+def infer_patch_probs(patches_np, batch_size=64):
+    all_probs = []
+    for k in range(0, len(patches_np), batch_size):
+        batch_np = patches_np[k:k+batch_size]
+        batch_t  = torch.stack([patch_transform(p) for p in batch_np], dim=0).to(device)
+        logits   = model(batch_t)
+        probs    = F.softmax(logits, dim=1).cpu().numpy()
+        all_probs.append(probs)
+    return np.concatenate(all_probs, axis=0)
+
+probs = infer_patch_probs(patches, batch_size=batch_size)
+assert probs.shape == (N, num_classes), f"Unexpected probs shape {probs.shape}"
+print("[OK] Inference done.")
+
+
+# =========================
+#       HEATMAP BUILD
+# =========================
+grid_h = (H - patch_size) // stride + 1
+grid_w = (W - patch_size) // stride + 1
+assert grid_h * grid_w == N, f"Expected {grid_h*grid_w} patches, got {N}"
+
+pos_idx = 1 if num_classes > 1 else 0
+heat_grid = probs[:, pos_idx].reshape(grid_h, grid_w)
+hm = cv2.resize(heat_grid, (W, H), interpolation=cv2.INTER_CUBIC)
+
+print(f"[INFO] heat_map min/max: {hm.min():.4f}/{hm.max():.4f}")
+
+# Optional bboxes
+def find_bboxes_for_image(bbox_csv_path, img_path):
+    if not bbox_csv_path or not os.path.exists(bbox_csv_path):
+        return []
+    df = pd.read_csv(bbox_csv_path)
+    m = df[df['path'].astype(str) == str(img_path)]
+    if len(m) == 0:
+        base = os.path.basename(img_path)
+        m = df[df['path'].astype(str).str.endswith(base)]
+    boxes = []
+    for _, r in m.iterrows():
+        try:
+            boxes.append((float(r['xmin']), float(r['ymin']), float(r['xmax']), float(r['ymax'])))
+        except Exception:
+            pass
+    return boxes
+
+boxes = find_bboxes_for_image(bbox_csv, image_path)
+
+
+# =========================
+#   PLOT: ORIGINAL + HM
+# =========================
+fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+ax[0].imshow(im_f01_gray, cmap='gray')
+ax[0].set_title("Original image")
+for (xmin, ymin, xmax, ymax) in boxes:
+    rect = mpatches.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
+                              fill=False, edgecolor='red', linewidth=2)
+    ax[0].add_patch(rect)
+
+ax[1].imshow(im_f01_gray, cmap='gray')
+hm_show = ax[1].imshow(hm, cmap='jet', alpha=0.35, vmin=0.0, vmax=1.0)
+ax[1].set_title("Heatmap overlay")
+fig.colorbar(hm_show, ax=ax[1], fraction=0.046, pad=0.04, label="P(lesion)")
+for a in ax: a.axis('off')
+plt.tight_layout()
+plt.show()
+
+
+# =========================
+#      WARP + QUIVERS
+# =========================
+img_t  = torch.from_numpy(im_f01_gray.astype(np.float32))  # HxW
+heat_t = torch.from_numpy(hm.astype(np.float32))           # HxW
+
+# Deformation params
+fwhm  = 20.0   # Gaussian FWHM for kernels
+scale = 3.0    # softmax scale
+lambd = 0.5    # 0 (structured) .. 1 (pixel)
+
+# Build both grids and blend (keeping grid for quivers)
+s_img, structured_grid = warped_str(img_t, heat_t, (H, W), fwhm, scale)
+p_img,    pixel_grid   = warped_imgs(img_t, heat_t, (H, W), fwhm, scale)
+src_grid = torch.clamp((1.0 - lambd) * structured_grid + lambd * pixel_grid, -1.0, 1.0)
+
+# Sample with blended grid
+img_bchw = img_t[None, None, :, :]
+warped_t = F.grid_sample(img_bchw, src_grid, align_corners=False)
+warped   = warped_t[0, 0].detach().cpu().numpy()
+
+# Displacements for quiver (align_corners=False mapping)
+gx = src_grid[0, :, :, 0].detach().cpu().numpy()
+gy = src_grid[0, :, :, 1].detach().cpu().numpy()
+x_new = ((gx + 1.0) * W - 1.0) / 2.0
+y_new = ((gy + 1.0) * H - 1.0) / 2.0
+
+Xg, Yg = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
+U = x_new - Xg
+V = y_new - Yg
+
+# Downsample + magnitude mask for readability
+QUIVER_NX, QUIVER_NY = 30, 30
+step_x = max(1, W // QUIVER_NX)
+step_y = max(1, H // QUIVER_NY)
+Xq = Xg[::step_y, ::step_x]
+Yq = Yg[::step_y, ::step_x]
+Uq = U[::step_y, ::step_x]
+Vq = V[::step_y, ::step_x]
+mag = np.hypot(Uq, Vq)
+keep = mag > 0.5  # pixels; tweak threshold
+
+# Plot
+fig2, axs2 = plt.subplots(1, 2, figsize=(12, 6))
+axs2[0].imshow(im_f01_gray, cmap='gray', vmin=0, vmax=1)
+axs2[0].quiver(Xq[keep], Yq[keep], Uq[keep], Vq[keep],
+               color='red', angles='xy', scale_units='xy', scale=1, width=0.0025)
+axs2[0].set_title("Original + displacement vectors")
+axs2[0].axis('off')
+
+axs2[1].imshow(warped, cmap='gray', vmin=0, vmax=1)
+axs2[1].set_title("Warped image (blended grid)")
+axs2[1].axis('off')
+
+plt.tight_layout()
+plt.show()
