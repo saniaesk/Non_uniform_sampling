@@ -1,0 +1,25 @@
+import pandas as pd
+from pathlib import Path
+
+def split_csv_by_split_column(input_csv_path: str):
+    # Define the input path and derive the directory
+    input_path = Path(input_csv_path)
+    output_dir = input_path.parent
+
+    # Load the CSV into a DataFrame
+    df = pd.read_csv(input_path)
+
+    # Split the DataFrame based on the 'split' column
+    train_df = df[df['split'] == 'training']
+    test_df = df[df['split'] == 'test']
+
+    # Save the resulting DataFrames to new CSV files
+    train_df.to_csv(output_dir / 'training_resized_images.csv', index=False)
+    test_df.to_csv(output_dir / 'test_resized_images.csv', index=False)
+
+
+if __name__ == "__main__":
+    # Update this path if needed
+    csv_path = r"/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/resized_images_manifestold.csv"
+    split_csv_by_split_column(csv_path)
+print("CSV files 'training_resized_images.csv' and 'test_resized_images.csv' have been created.")
