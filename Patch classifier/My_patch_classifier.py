@@ -5,7 +5,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from torchvision import transforms as T  
-from Patch_classifier_utils_3 import initialize_dataloaders, set_seed, initialize_model, train_model, test_func
+from Patch_classifier_utils import initialize_dataloaders, set_seed, initialize_model, train_model, test_func
 import json
 
 
