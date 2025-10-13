@@ -1,7 +1,7 @@
 # Non_uniform_sampling
 
 A complete, reproducible pipeline for screening mammography that follows a **patch → heatmap → non-uniform warp → whole-image** strategy.  
-Built around **VinDr-Mammo**, it (1) preprocesses images, (2) creates **S** and **S10** patch datasets, (3) trains a **patch classifier**, (4) produces lesion-probability **heatmaps**, and (5) performs **saliency-guided warping** controlled by **`scale`** and **`FWHM`** to emphasize suspicious regions for the **whole-image classifier**.
+Built around **VinDr-Mammo**, it (1) preprocesses images, (2) creates **S** and **S10** patch datasets, (3) trains a **patch classifier**, (4) produces lesion-probability **heatmaps**, and (5) performs **saliency-guided warping** controlled by **`scale`** and **`FWHM`** to emphasize suspicious regions for the **whole image classifier**.
 
 ---
 
@@ -22,21 +22,23 @@ Built around **VinDr-Mammo**, it (1) preprocesses images, (2) creates **S** and 
 - `CSV_generator.py` – splits manifest into `training_resized_images.csv` / `test_resized_images.csv`
 
 **Patch generator (S/S10)**
-- `My_patch_generator3.py` – builds **S** (1 ROI + 1 background) and **S10** (10 ROI-near + backgrounds)
-- `patches_utils_3.py` – sampling rules, overlap cutoffs, padding, PNG writing
+- `My_patch_generator.py` – builds **S** (1 ROI + 1 background) and **S10** (10 ROI-near + backgrounds)
+- `patches_utils.py` – sampling rules, overlap cutoffs, padding, PNG writing
 
 **Patch classifier**
-- `My_patch_classifier_main_3.py` – 3-stage fine-tuning, metrics, checkpointing
-- `Patch_classifier_utils_3.py` – dataloaders, transforms, mean/std, weighted sampler
+- `My_patch_classifier.py` – 3-stage fine-tuning, metrics, checkpointing
+- `Patch_classifier_utils.py` – dataloaders, transforms, mean/std, weighted sampler
 
 **Heatmaps & non-uniform warping**
 - `DeformationUtils.py` – Gaussian builders, pixel/structure-driven grids, blended sampler (`grid_sample`)
-- `My_WARP5.py`, `My_deformation2.py` – single-image demos & ablations
-- `SingleDeformation_2.py` – one-off: heatmap + quivers + warped output (for figures)
+- `My_WARP.py`, `My_deformation.py` – single-image demos & ablations
+- `SingleDeformation.py` – one-off: heatmap + quivers + warped output (for figures)
 - `WARP_all_images_AUTO.py` – batch heatmaps/overlays/warps (parameterized filenames)
 
 **Whole-image classifier**
 - `whole_classifier_model.py` – image-level model (patch backbone + ResNet blocks + classifier head)
+- `main.py` — Trains and evaluates the whole-image mammography classifier: builds dataloaders, initializes the ResNet-50–based model, runs two-stage fine-tuning, and reports accuracy/AUC.
+- `tools.py` — Utilities for data and labels: parses BI-RADS→binary labels, assembles 3-channel samples (original/warped/heatmap) from scale/FWHM folders, and creates stratified train/val/test dataloaders.
 
 ---
 
