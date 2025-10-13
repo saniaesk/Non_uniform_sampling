@@ -7,7 +7,7 @@ Built around **VinDr-Mammo**, it (1) preprocesses images, (2) creates **S** and 
 
 ## Highlights
 
-- End-to-end scripts: preprocess → patches → patch training → heatmaps → warps → whole-image training/eval  
+- End-to-end scripts: preprocess → patch_generator → patch_classifier_training → heatmap_extraction → non_uniform_deformation → whole-image_classifier_training/eval  
 - **Non-uniform sampling** (deformation) with tunable **`scale`** (saliency sharpening) and **`FWHM`** (displacement smoothness)  
 - 16-bit PNG pipeline, breast segmentation, consistent bbox remapping  
 - Deterministic options and clean separation of data, models, and artifacts
