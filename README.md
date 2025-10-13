@@ -21,7 +21,7 @@ Built around **VinDr-Mammo**, it (1) preprocesses images, (2) creates **S** and 
 - `My_Resize.py`, `resize_utils.py` – resizing (1152×896), segmentation, bbox remap, 16-bit I/O
 - `CSV_generator.py` – splits manifest into `training_resized_images.csv` / `test_resized_images.csv`
 
-**Patch datasets (S/S10)**
+**Patch generator (S/S10)**
 - `My_patch_generator3.py` – builds **S** (1 ROI + 1 background) and **S10** (10 ROI-near + backgrounds)
 - `patches_utils_3.py` – sampling rules, overlap cutoffs, padding, PNG writing
 
