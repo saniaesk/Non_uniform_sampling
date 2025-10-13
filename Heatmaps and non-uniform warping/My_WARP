@@ -1,0 +1,345 @@
+import os
+import json
+import cv2
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from Patch_classifier_utils import initialize_model
+
+
+# --------------- Config ---------------
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model_name   = "resnet"
+num_classes  = 2
+batch_size   = 64
+patch_size   = 224
+stride       = 32
+
+weights_dict = '/home/AD/ses235/Documents/My_Project/VinDr_Mamo/saved_models/20percentcutoff.s10.pth'
+bbox_csv = "/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/resized_images_manifest.csv" 
+image_path = "/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/resized_images_VinDr-Mammo/resized_image_30.png"
+norm_json = "saved_models/train_norm.json"
+
+
+fallback_mean, fallback_std = 0.3385, 0.3344
+if os.path.exists(norm_json):
+    with open(norm_json, "r") as f:
+        _s = json.load(f)
+    mean_pixel = float(_s.get("mean", fallback_mean))
+    std_pixel  = float(_s.get("std",  fallback_std))
+else:
+    mean_pixel, std_pixel = fallback_mean, fallback_std
+
+print(f"[INFO] mean/std used -> {mean_pixel:.6f} / {std_pixel:.6f}")
+
+
+# --------------- Model ---------------
+model = initialize_model(model_name, num_classes=num_classes, use_pretrained=False).to(device)
+ckpt = torch.load(weights_dict, map_location="cpu")
+state = ckpt.get("model_state_dict", ckpt)
+model.load_state_dict(state, strict=False)
+model.eval()
+print("[OK] Model loaded from:", weights_dict)   #load the dictonary after call the model 
+
+
+# --------------- Image I/O (16-bit) ---------------
+path = image_path
+im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+f = im.astype(np.float32) / 65535.0
+
+im_u16 = im
+im_f01_gray = f  ## im_f01_gray: Same image but normalized to [0,1] floats (float32).
+
+
+H, W = im_f01_gray.shape
+print(f"[INFO] Image uint16 min/max: {int(im_u16.min())}/{int(im_u16.max())}")                # Shows the minimum and maximum raw pixel values from the original image (0–65535)
+print(f"[INFO] Image float[0,1] min/max: {im_f01_gray.min():.5f}/{im_f01_gray.max():.5f}")    # Shows the normalized values (always between 0 and 1)
+
+# Build a 3-channel float image in [0,1] for patching
+# When np.stack() is used, the resulting array will have one more dimension than the input arrays.
+image_np = np.stack([im_f01_gray, im_f01_gray, im_f01_gray], axis=-1)  # H×W×3   
+
+
+# --------------- Patch extraction & transform ---------------
+def extract_patches(image, patch_size, stride):
+    """image: H×W×3 float [0,1]"""
+    patches = []
+    h, w, _ = image.shape
+    for i in range(0, h - patch_size + 1, stride):
+        for j in range(0, w - patch_size + 1, stride):
+            patch = image[i:i+patch_size, j:j+patch_size, :]
+            patches.append(patch)
+    return np.array(patches)
+
+
+# ----------------patch normalization + tensor conversion function -----------------
+def patch_transform(patch_f01_3ch):  # (patch_f01_3ch = A single patch extracted from image_np)... image_np = Entire mammogram
+    """H×W×3 float[0,1] -> torch.FloatTensor [3,H,W], normalized with scalar mean/std."""
+    x3 = np.transpose(patch_f01_3ch, (2, 0, 1))  # C×H×W
+    x3 = (x3 - mean_pixel) / (std_pixel if std_pixel > 0 else 1.0)
+    return torch.from_numpy(x3).float()
+
+patches = extract_patches(image_np, patch_size, stride)
+N = len(patches)
+print(f"[INFO] patches extracted: {N}")
+
+
+# --------------- Run inference over patches ---------------    # prepare each batch of patches for the model
+def infer_patch_probs(patches, batch_size=64, class_dim=1):                                
+    all_probs = []
+    with torch.no_grad():
+        for k in range(0, len(patches), batch_size):
+            batch_np = patches[k:k+batch_size]
+            batch_t  = torch.stack([patch_transform(p) for p in batch_np], dim=0).to(device)  # [B,3,h,w]       # Here Normalized 
+            logits   = model(batch_t)  # [B,C]
+            probs    = F.softmax(logits, dim=1)  # [B,C]
+            all_probs.append(probs.cpu().numpy())
+    probs_full = np.concatenate(all_probs, axis=0)  # [N,C]
+    return probs_full
+
+probs = infer_patch_probs(patches, batch_size=batch_size)
+assert probs.shape[0] == N and probs.shape[1] == num_classes, f"Unexpected probs shape {probs.shape}"
+print("[OK] Inference done.")   #We have successfully run the trained neural network on all extracted patches and obtained prediction probabilities for each one.
+
+
+# --------------- Recompose to heatmap ---------------
+grid_h = (H - patch_size) // stride + 1
+grid_w = (W - patch_size) // stride + 1
+assert grid_h * grid_w == N, f"Expected {grid_h*grid_w} patches, got {N}"
+
+# Choose positive class index (1 if [background, lesion])
+pos_idx = 1 if num_classes > 1 else 0
+heat_grid = probs[:, pos_idx].reshape(grid_h, grid_w)  # coarse grid
+
+# Upsample grid to full image size
+#heat_up = cv2.resize(heat_grid, (W, H), interpolation=cv2.INTER_LINEAR)
+heat_up = cv2.resize(heat_grid, (W, H), interpolation=cv2.INTER_CUBIC)
+hm = heat_up
+# Optional smoothing (sigma tied to patch size)
+#sigma = patch_size / 6.0
+#heat_up = cv2.GaussianBlur(heat_up, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+
+# --------------- BBox overlay ---------------
+def find_bboxes_for_image(bbox_csv, image_path):
+    if not os.path.exists(bbox_csv):
+        return []
+    df = pd.read_csv(bbox_csv)
+    # Try exact path match
+    m = df[df['path'].astype(str) == str(image_path)]
+    if len(m) == 0:
+        # Try basename match (handles folder naming differences)
+        base = os.path.basename(image_path)
+        m = df[df['path'].astype(str).str.endswith(base)]
+    boxes = []
+    for _, r in m.iterrows():
+        try:
+            boxes.append((float(r['xmin']), float(r['ymin']), float(r['xmax']), float(r['ymax'])))
+        except Exception:
+            pass
+    return boxes
+
+boxes = find_bboxes_for_image(bbox_csv, image_path)
+
+
+# --------------- Plot ---------------
+plt.imshow(hm)
+print(f"[INFO] heat_map min/max: {(hm.min())}/{(hm.max())}")  
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+
+# Original + bboxes
+ax[0].imshow(im_f01_gray, cmap='gray')
+ax[0].set_title("Original image")
+for (xmin, ymin, xmax, ymax) in boxes:
+    rect = mpatches.Rectangle((xmin, ymin), xmax - xmin, ymax - ymin,
+                              fill=False, edgecolor='red', linewidth=2)
+    ax[0].add_patch(rect)
+
+# Heatmap overlay
+ax[1].imshow(im_f01_gray, cmap='gray')
+hm_show = ax[1].imshow(hm, cmap='jet', alpha=0.35, vmin=0.0, vmax=1.0)
+ax[1].set_title("Heatmap overlay")
+fig.colorbar(hm_show, ax=ax[1], fraction=0.046, pad=0.04, label="P(lesion)")
+
+for a in ax:
+    a.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
+# ==================================================
+#                     WARP
+#   Pick center from heatmap (the hottest pixels)
+#   Apply ripple-based saliency warp to the full image
+#   Gaussian smoothing uses makeGaussian (FWHM) + torch conv2d (reflect pad)
+# ==================================================
+
+from scipy.ndimage import map_coordinates  # sampler for warping based on coordinate maps
+
+# ---------------- Tunables (user-facing) ----------------
+window_size = 0.20         # e.g., 0.20 → radius = 20% of max(H,W)
+sigma       = None         # Gaussian std dev in pixels; if None or <=0 → defaults to 0.10*max(H,W)
+
+
+def kernel_size_from_sigma(sigma_px: float) -> int:
+    k = int(round(6 * sigma_px + 1))
+    return k if (k % 2 == 1) else (k + 1)
+
+
+def makeGaussian(size, fwhm=3, center=None):
+    """Make a square Gaussian kernel (FWHM parameterization)."""
+    x = np.arange(0, size, 1, float)
+    y = x[:, np.newaxis]
+    if center is None:
+        x0 = y0 = size // 2
+    else:
+        x0, y0 = center
+    return np.exp(-4 * np.log(2) * ((x - x0) ** 2 + (y - y0) ** 2) / (fwhm ** 2))
+
+
+def _gaussian_blur_reflect_torch(arr_np: np.ndarray, sigma_px: float, kernel_size: int) -> np.ndarray:
+    """
+    Gaussian blur using PyTorch:
+    - build explicit 2D kernel via makeGaussian(FWHM)
+    - reflection padding
+    - conv2d (no auto-derivation)
+    Returns a NumPy array with same H×W.
+    """
+    k = int(kernel_size)
+    if k < 1: k = 1
+    if k % 2 == 0: k += 1
+
+    # sigma -> FWHM
+    fwhm = 2.0 * np.sqrt(2.0 * np.log(2.0)) * float(sigma_px)
+    K = makeGaussian(k, fwhm=fwhm).astype(np.float32)       # build k×k Gaussian kernel (float32)
+    K /= (K.sum() + 1e-8)       # normalize kernel so weights sum to 1
+    weight = torch.from_numpy(K)[None, None, :, :]  # shape [out=1, in=1, k, k] for conv2d 
+
+    x = torch.from_numpy(arr_np.astype(np.float32))[None, None, :, :]  # input to tensor: [N=1,C=1,H,W]
+    pad = k // 2            # symmetric padding size on all sides
+    x = F.pad(x, (pad, pad, pad, pad), mode='reflect')  # reflect-pad to avoid edge artifacts, left,right,top,bottom
+    out = F.conv2d(x, weight)           # 2D convolution with our kernel
+    return out[0, 0].detach().cpu().numpy()     # back to NumPy array H×W
+
+
+def _weighted_center_from_heatmap(hm: np.ndarray, top_frac: float = 0.01):
+    """
+    Weighted centroid of the top `top_frac` hottest pixels in the heatmap.
+    Fallback to argmax if needed. Returns (xc, yc) in pixel coordinates.
+    """
+    Hh, Wh = hm.shape
+    flat = hm.ravel()
+    k = max(1, int(len(flat) * top_frac))
+    idx = np.argpartition(flat, -k)[-k:]
+    ys, xs = np.unravel_index(idx, (Hh, Wh))
+    w = flat[idx].astype(np.float64)
+    s = w.sum()
+    if s <= 0:
+        iy, ix = np.unravel_index(np.argmax(hm), hm.shape)
+        return float(ix), float(iy)
+    xc = float((xs * w).sum() / s)
+    yc = float((ys * w).sum() / s)
+    return xc, yc
+
+
+# 1) Center from heatmap
+xc, yc = _weighted_center_from_heatmap(hm, top_frac=0.01)
+print(f"[WARP] center from heatmap (xc,yc): ({xc:.1f}, {yc:.1f})")
+
+
+# 2) Saliency from HEATMAP
+xg, yg = np.meshgrid(                               # build per-pixel coordinate grids:
+    np.arange(W, dtype=np.float32),                 #  x-coordinates 0..W-1 (float32)
+    np.arange(H, dtype=np.float32)                  #  y-coordinates 0..H-1 (float32)
+)
+dist = np.sqrt((xg - xc) ** 2 + (yg - yc) ** 2)     # Euclidean distance of every pixel (xg,yg) to the center (xc,yc)
+
+
+# local radius (same window_size meaning as threshold)
+radius_px = float(window_size) * max(H, W)
+radial_mask = (dist <= radius_px).astype(np.float32)
+
+# Normalize heatmap to [0,1] and (optionally) sharpen/soften with gamma
+hm01  = (hm - hm.min()) / (hm.max() - hm.min() + 1e-8)
+gamma = 1.0               # try 0.7 for sharper focus or 1.3 for softer
+hm01  = hm01 ** gamma
+
+# Final saliency map (add tiny epsilon to avoid zero denom)
+sal_map = hm01 * radial_mask + 0.01
+
+
+# 3) Smooth weighted coords → sampling grid
+x_norm = xg / max(W - 1, 1)
+y_norm = yg / max(H - 1, 1)
+
+# Resolve sigma (pixels) and kernel_size
+if sigma is None or sigma <= 0:
+    sigma_px = 0.10 * max(H, W)     # default: 10% of the bigger dimension
+else:
+    sigma_px = float(sigma)
+
+kernel_size = kernel_size_from_sigma(sigma_px)  # explicit odd kernel
+
+# Apply Gaussian smoothing with our explicit kernel (torch conv2d + reflect pad)
+denom = _gaussian_blur_reflect_torch(sal_map, sigma_px=sigma_px, kernel_size=kernel_size)
+num_u = _gaussian_blur_reflect_torch(sal_map * x_norm, sigma_px=sigma_px, kernel_size=kernel_size)
+num_v = _gaussian_blur_reflect_torch(sal_map * y_norm, sigma_px=sigma_px, kernel_size=kernel_size)
+
+eps = 1e-8
+u = num_u / (denom + eps)   # smoothed, normalized x in [0,1]
+v = num_v / (denom + eps)   # smoothed, normalized y in [0,1]
+
+x_new = u * (W - 1)         # map back to pixel coords
+y_new = v * (H - 1)
+
+
+# 4) Warp original grayscale image
+Iu8 = (np.clip(im_f01_gray, 0, 1) * 255.0).astype(np.uint8)   # clamp to [0,1], scale to [0,255], convert to 8-bit
+
+warped = map_coordinates(                                     # sample the source image at new coordinates:
+    Iu8,                                                      #   source: uint8 grayscale image
+    [y_new.ravel(), x_new.ravel()],                           #   sampling points (row=y, col=x) flattened to 1D
+    order=1,                                                  #   bilinear interpolation (smooth, fast)
+    mode='reflect'                                            #   reflect at borders to avoid edge artifacts
+).reshape(H, W).astype(np.uint8)                              # back to H×W image, ensure uint8 type
+
+
+# 5) Final plot: keep QUIVER, show full warped image
+fig2, axs2 = plt.subplots(1, 2, figsize=(12, 6))
+
+# Left: Original + center + quiver
+axs2[0].imshow(Iu8, cmap='gray', vmin=0, vmax=255)
+axs2[0].scatter([xc], [yc], s=60, c='red', marker='x', linewidths=2)
+axs2[0].set_title(
+    f"Original + center (vectors)\nwindow_size={window_size}, sigma={sigma_px:.1f}, kernel_size={kernel_size}"
+)
+axs2[0].axis('on')
+
+# Quiver density control
+QUIVER_NX, QUIVER_NY = 30, 30
+step_x = max(1, W // QUIVER_NX)
+step_y = max(1, H // QUIVER_NY)
+Xq = xg[::step_y, ::step_x]
+Yq = yg[::step_y, ::step_x]
+Uq = (x_new - xg)[::step_y, ::step_x]
+Vq = (y_new - yg)[::step_y, ::step_x]
+
+# Keep arrows near the effect radius (does not crop the image)
+mask = ((Xq - xc) ** 2 + (Yq - yc) ** 2) <= (radius_px ** 2)
+axs2[0].quiver(
+    Xq[mask], Yq[mask], Uq[mask], Vq[mask],
+    color='red', angles='xy', scale_units='xy', scale=1, width=0.0025
+)
+
+# Right: FULL warped image
+axs2[1].imshow(warped, cmap='gray', vmin=0, vmax=255)
+axs2[1].set_title("Warped image")
+axs2[1].axis('on')
+
+plt.tight_layout()
+plt.show()
