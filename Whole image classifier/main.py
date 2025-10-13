@@ -1,249 +1,204 @@
-import os
-import re
-from typing import Tuple, List
 import numpy as np
-import pandas as pd
-import cv2
 import torch
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import StratifiedShuffleSplit
+import torch.nn as nn
+from torch.optim import Adam
+from sklearn.metrics import accuracy_score, roc_auc_score
+from tqdm import tqdm 
+from tools import build_dataloaders, CLASS_NAMES
+from whole_classifier_model import WholeImageClassifier
 
 
-# -----------------------------
-# Binary label mapping
-# -----------------------------
-CLASS_NAMES = {0: "BI-RADS 1–2", 1: "BI-RADS 3–5"}
+# =========================
+#        CONFIG
+# =========================
+CONFIG = {
+    # Required CSVs
+    #"train_csv":  "/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/training_resized_images.csv",
+    "train_csv":  "E:/VinDr_mammo/training_resized_images.csv",
 
-# -----------------------------
-# Label parsing
-# -----------------------------
-def _parse_birads_to_binary(s) -> int:
+    #"test_csv":   "/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/test_resized_images.csv",
+    "test_csv":   "E:/VinDr_mammo/test_resized_images.csv",
+
+    # Manifest used during warp/heat generation (for consistent idx mapping)
+    #"manifest_csv": "/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/resized_images_manifestold.csv",
+    "manifest_csv": "E:/VinDr_mammo/resized_images_manifest.csv",
+
+    # Root containing the warped/heat folders
+    #"base_root": "/home/AD/ses235/physionet.org/files/vindr-mammo/1.0.0/warped_datasets",
+    "base_root": "E:/VinDr_mammo",
+
+
+    # Warped/heat parameter (Important: must match generated datasets)
+    "scale": 20.0,
+    "fwhm":  15.0,
+
+    # Validation split from training CSV
+    "val_ratio": 0.15,
+    "seed": 42,
+
+    # Image & batching
+    "height": 512,
+    "width":  512,
+    "batch":  16,
+    "workers": 4,
+
+    # Normalization (per-channel for [orig, warped, heat])
+    "means": (0.3522, 0.3522, 0.3522),
+    "stds":  (0.3316, 0.3316, 0.3316),
+
+    # Training schedule
+    "epochs_stage1": 15,   # train layer4 + fc
+    "epochs_stage2": 25,   # unfreeze all
+    "lr1": 1e-4, "wd1": 1e-4,
+    "lr2": 1e-5, "wd2": 1e-4,
+
+    # Model init
+    "use_imagenet_pretrain": True,
+}
+
+
+# =========================
+#     UTIL FUNCTIONS
+# =========================
+def set_seed(seed: int = 42):
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def train_one_stage(model, loaders, device, epochs=20, lr=1e-4, wd=1e-4, unfreeze_all=False):
     """
-    Accepts 'BI-RADS 3', 'BIRADS 2', '3', 3, etc.
-    Returns binary: 0 for BI-RADS 1-2, 1 for BI-RADS 3-5.
+    One training stage. If unfreeze_all=False, train only layer4 + fc.
     """
-    if isinstance(s, (int, np.integer, float, np.floating)):
-        k = int(s)
-        if 0 <= k <= 4:   # if already 0..4 (sometimes stored), interpret as 1..5
-            k = k + 1
-        if 1 <= k <= 5:
-            return 0 if k <= 2 else 1
-
-    s = str(s).strip().upper().replace("_", "-")
-    m = re.search(r"(?:BI-?RADS\s*)?([1-5])", s)
-    if not m:
-        raise ValueError(f"Unrecognized BI-RADS label: {s}")
-    k = int(m.group(1))
-    return 0 if k <= 2 else 1
-
-
-# -----------------------------
-# Image I/O
-# Reads PNG as grayscale float32 in [0,1]. Handles 8-bit or 16-bit images correctly.
-# -----------------------------
-def _imread_float01_gray(path: str) -> np.ndarray:
-    """Load image as float32 in [0,1], grayscale HxW. Supports 8/16-bit."""
-    im = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if im is None:
-        raise FileNotFoundError(path)
-    if im.ndim == 3:
-        im = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-    if im.dtype == np.uint16:
-        x = im.astype(np.float32) / 65535.0
+    if not unfreeze_all:
+        for p in model.parameters():
+            p.requires_grad = False
+        for name, p in model.named_parameters():
+            if name.startswith("backbone.layer4.") or name.startswith("backbone.fc"):
+                p.requires_grad = True
     else:
-        x = im.astype(np.float32) / 255.0
-    return np.clip(x, 0.0, 1.0)
+        for p in model.parameters():
+            p.requires_grad = True
 
-# These 2 functions provide human (natural) sorting
-def _natural_key(s: str):
-    """Sort helper: (human order).""" #'warped_image_10.png' after 'warped_image_2.png' 
-    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', os.path.basename(s))]
+    params = [p for p in model.parameters() if p.requires_grad]
+    optim = Adam(params, lr=lr, weight_decay=wd)
+    criterion = nn.CrossEntropyLoss()
 
-def _sorted_pngs(folder: str) -> List[str]:
-    files = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".png")]
-    files.sort(key=_natural_key)
-    return files
+    best_wts = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    best_acc = 0.0
+
+    for ep in range(epochs):
+        for phase in ("train", "val"):
+            model.train(mode=(phase == "train"))
+            running_loss, y_true, y_pred = 0.0, [], []
+
+            loader = loaders[phase]
+            # Progress bar over batches for this phase/epoch
+            for xb, yb in tqdm(loader, desc=f"[{phase}] epoch {ep+1}/{epochs}", dynamic_ncols=True, leave=False):
+                xb = xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True)
+
+                with torch.set_grad_enabled(phase == "train"):
+                    logits = model(xb)                # Bx2
+                    loss = criterion(logits, yb)      # CE on logits
+                    if phase == "train":
+                        optim.zero_grad()
+                        loss.backward()
+                        optim.step()
+
+                running_loss += loss.item() * xb.size(0)
+                y_true.extend(yb.detach().cpu().tolist())
+                y_pred.extend(logits.detach().cpu().argmax(dim=1).tolist())
+
+            epoch_loss = running_loss / len(loader.dataset)
+            acc = accuracy_score(y_true, y_pred)
+            print(f"[{phase:5}] epoch {ep+1:02d} | loss={epoch_loss:.4f} | acc={acc:.4f}")
+
+            if phase == "val" and acc > best_acc:
+                best_acc = acc
+                best_wts = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    model.load_state_dict(best_wts, strict=True)
+    return best_acc
 
 
-# -----------------------------
-# Dataset: fully sequential by folder order
-# -----------------------------
-class MultiSourceMammoDataset(Dataset):
+@torch.no_grad()
+def evaluate(model, loader, device):
     """
-    Emits a 3-channel tensor for each sample [orig, warped, heat] and a binary label.
-
-    Sequential policy:
-      - Read the CSV rows in their existing order.
-      - Enumerate PNGs in the warped/heat directories in natural sorted order.
-      - Pair row i with warped_pngs[i] and heat_pngs[i].
+    Binary evaluation: returns accuracy and ROC AUC for the positive class (BI-RADS 3–5).
     """
-    def __init__(
-        self,
-        csv_file: str,
-        base_root: str,
-        scale: float,
-        fwhm: float,
-        image_size: Tuple[int, int] = (512, 512),
-        mean_3ch: Tuple[float, float, float] = (0.3385, 0.3385, 0.3385),
-        std_3ch: Tuple[float, float, float] = (0.3344, 0.3344, 0.3344),
-    ):
-        self.base_root = base_root
-        self.scale = self._fmt(scale)
-        self.fwhm = self._fmt(fwhm)
-        self.size = image_size
-        self.mean = np.array(mean_3ch, dtype=np.float32)
-        self.std = np.array(std_3ch, dtype=np.float32)
+    model.eval()
+    y_true, y_prob1 = [], []  # prob of class 1 (BI-RADS 3–5)
 
-        # 1) CSV in given order
-        df = pd.read_csv(csv_file)
-        df = self._harmonize_cols(df)
-        paths_src = df["path"].astype(str).tolist()
-        labels = df["label"].tolist()
+    # Progress bar for evaluation
+    for xb, yb in tqdm(loader, desc="[test] inference", dynamic_ncols=True):
+        xb = xb.to(device, non_blocking=True)
+        logits = model(xb)
+        probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()  # p(class=1)
+        y_true.extend(yb.numpy().tolist())
+        y_prob1.extend(probs.tolist())
 
-        # 2) Folders → natural-sorted PNG lists
-        warp_dir = os.path.join(
-            self.base_root,
-            f"scale{self.scale}_fwhm{self.fwhm}",
-            f"warped_images_scale{self.scale}_fwhm{self.fwhm}",
-        )
-        heat_dir = os.path.join(
-            self.base_root,
-            f"scale{self.scale}_fwhm{self.fwhm}",
-            f"heatmaps_scale{self.scale}_fwhm{self.fwhm}",
-        )
-        warped_pngs = _sorted_pngs(warp_dir)
-        heat_pngs   = _sorted_pngs(heat_dir)
+    y_true = np.array(y_true)
+    y_prob1 = np.array(y_prob1)
+    y_pred = (y_prob1 >= 0.5).astype(int)
 
-        # 3) Match by position: i-th row ↔ i-th png
-        n = len(paths_src)
-        if not (len(warped_pngs) >= n and len(heat_pngs) >= n):
-            raise RuntimeError(
-                f"Not enough warped/heat PNGs for CSV rows. "
-                f"rows={n}, warped={len(warped_pngs)}, heat={len(heat_pngs)}"
-            )
-
-        self.samples = []
-        for i in range(n):
-            src = paths_src[i]
-            y_bin = _parse_birads_to_binary(labels[i])
-            self.samples.append({
-                "src": src,
-                "warp": warped_pngs[i],
-                "heat": heat_pngs[i],
-                "y": int(y_bin),
-            })
-
-        # Optional peek
-        head = self.samples[:3]
-        print("[Dataset:folder-sequential] examples:", [
-            (os.path.basename(s['warp']), os.path.basename(s['heat'])) for s in head
-        ])
-
-    @staticmethod
-    def _harmonize_cols(df: pd.DataFrame) -> pd.DataFrame:
-        # renames columns to the expected names
-        cols = {c.lower(): c for c in df.columns}
-        need = {"path", "label"}
-        if not need.issubset(set(cols.keys())):
-            raise KeyError(f"CSV must contain columns {need}, got {df.columns.tolist()}")
-        return df.rename(columns={cols["path"]: "path", cols["label"]: "label"})[["path", "label"]].copy()
-
-    @staticmethod
-    def _fmt(v: float) -> str:
-        # formats numbers (e.g., 20.0 → "20") to match folder names
-        s = f"{v}"
-        return s.rstrip("0").rstrip(".") if "." in s else s
-
-    def __len__(self) -> int:
-        # number of samples
-        return len(self.samples)
-
-    def _resize_hw(self, x: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
-        H, W = size
-        # Resizes to (H, W) with cv2.INTER_AREA
-        return cv2.resize(x, (W, H), interpolation=cv2.INTER_AREA)
-
-    def __getitem__(self, i: int):
-        # Reads: original image (src), warped (warp), heatmap (heat) → all as gray float [0,1].
-        rec = self.samples[i]
-        img = _imread_float01_gray(rec["src"])
-        wrp = _imread_float01_gray(rec["warp"])
-        hmp = _imread_float01_gray(rec["heat"])
-
-        H, W = self.size
-        img = self._resize_hw(img, (H, W))
-        wrp = self._resize_hw(wrp, (H, W))
-        hmp = self._resize_hw(hmp, (H, W))
-
-        # Stacks to 3×H×W and applies per-channel normalization using provided means/stds
-        x = np.stack([img, wrp, hmp], axis=0).astype(np.float32)  # 3xHxW
-        x = (x - self.mean[:, None, None]) / (self.std[:, None, None] + 1e-8)
-
-        y = int(rec["y"])  # 0/1
-        return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
-        # returns (tensor, label)
+    acc = accuracy_score(y_true, y_pred)
+    try:
+        auc = roc_auc_score(y_true, y_prob1)
+    except Exception:
+        auc = float("nan")
+    return acc, auc
 
 
-# -----------------------------
-# Dataloaders (train/test CSVs; val from train)
-# -----------------------------
-def _read_csv_min(csv_file: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_file)
-    cols = {c.lower(): c for c in df.columns}
-    if "path" not in cols or "label" not in cols:
-        raise KeyError(f"{csv_file} must have 'path' and 'label' columns.")
-    return df.rename(columns={cols["path"]: "path", cols["label"]: "label"})[["path", "label"]].copy()
+# =========================
+#          MAIN
+# =========================
+def main():
+    cfg = CONFIG
+    set_seed(cfg["seed"])
 
-def _stratified_split(df: pd.DataFrame, val_ratio: float, seed: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    y = df["label"].apply(_parse_birads_to_binary).values
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_ratio, random_state=seed)
-    train_idx, val_idx = next(splitter.split(df, y))
-    return df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] device = {device}")
 
-def build_dataloaders(
-    base_root: str,
-    train_csv: str,
-    test_csv: str,
-    scale: float,
-    fwhm: float,
-    image_size: Tuple[int, int] = (512, 512),
-    batch_size: int = 16,
-    num_workers: int = 4,
-    means: Tuple[float, float, float] = (0.3385, 0.3385, 0.3385),
-    stds: Tuple[float, float, float] = (0.3344, 0.3344, 0.3344),
-    val_ratio: float = 0.15,
-    seed: int = 42,
-):
-    """
-    Returns {'train','val','test'} dataloaders.
-    Fully sequential: pairs CSV rows with warped/heat PNGs by folder order.
-    """
-    tr_df = _read_csv_min(train_csv)
-    te_df = _read_csv_min(test_csv)
-    tr_df, va_df = _stratified_split(tr_df, val_ratio=val_ratio, seed=seed)
-
-    # Persist small temp CSVs for Dataset constructor
-    tmp_dir = os.path.join(base_root, "_temp_splits_sequential")
-    os.makedirs(tmp_dir, exist_ok=True)
-    tr_csv = os.path.join(tmp_dir, "train.csv"); tr_df.to_csv(tr_csv, index=False)
-    va_csv = os.path.join(tmp_dir, "val.csv");   va_df.to_csv(va_csv, index=False)
-    te_csv = os.path.join(tmp_dir, "test.csv");  te_df.to_csv(te_csv, index=False)
-
-    ds_train = MultiSourceMammoDataset(
-        csv_file=tr_csv, base_root=base_root, scale=scale, fwhm=fwhm,
-        image_size=image_size, mean_3ch=means, std_3ch=stds
-    )
-    ds_val = MultiSourceMammoDataset(
-        csv_file=va_csv, base_root=base_root, scale=scale, fwhm=fwhm,
-        image_size=image_size, mean_3ch=means, std_3ch=stds
-    )
-    ds_test = MultiSourceMammoDataset(
-        csv_file=te_csv, base_root=base_root, scale=scale, fwhm=fwhm,
-        image_size=image_size, mean_3ch=means, std_3ch=stds
+    loaders = build_dataloaders(
+        base_root=cfg["base_root"],
+        train_csv=cfg["train_csv"],
+        test_csv=cfg["test_csv"],
+        scale=cfg["scale"],
+        fwhm=cfg["fwhm"],
+        image_size=(cfg["height"], cfg["width"]),
+        batch_size=cfg["batch"],
+        num_workers=cfg["workers"],
+        means=cfg["means"],
+        stds=cfg["stds"],
+        val_ratio=cfg["val_ratio"],
+        seed=cfg["seed"],
     )
 
-    dl_train = DataLoader(ds_train, batch_size=batch_size, shuffle=True,  num_workers=num_workers, pin_memory=True)
-    dl_val   = DataLoader(ds_val,   batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    dl_test  = DataLoader(ds_test,  batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    model = WholeImageClassifier(
+        num_classes=2, pretrained=bool(cfg["use_imagenet_pretrain"])
+    ).to(device)
 
-    return {"train": dl_train, "val": dl_val, "test": dl_test}
+    print("\n[Stage 1] Train head & last stage")
+    best_val_acc_1 = train_one_stage(
+        model, loaders, device,
+        epochs=cfg["epochs_stage1"], lr=cfg["lr1"], wd=cfg["wd1"], unfreeze_all=False
+    )
+
+    print("\n[Stage 2] Unfreeze all")
+    best_val_acc_2 = train_one_stage(
+        model, loaders, device,
+        epochs=cfg["epochs_stage2"], lr=cfg["lr2"], wd=cfg["wd2"], unfreeze_all=True
+    )
+
+    print(f"\n[VAL] best_acc_stage1={best_val_acc_1:.4f} | best_acc_stage2={best_val_acc_2:.4f}")
+
+    print("\n[TEST] evaluating best weights on test split…")
+    test_acc, test_auc = evaluate(model, loaders["test"], device)
+    print(f"[TEST] acc={test_acc:.4f} | ROC-AUC={test_auc:.4f}")
+    print("\n[CLASSES]", CLASS_NAMES)
+
+if __name__ == "__main__":
+    main()
