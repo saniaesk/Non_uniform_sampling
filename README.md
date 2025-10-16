@@ -33,7 +33,7 @@ Built around **VinDr-Mammo**, it (1) preprocesses images, (2) creates **S** and 
 - `DeformationUtils.py` – Gaussian builders, pixel/structure-driven grids, blended sampler (`grid_sample`)
 - `My_WARP.py`, `My_deformation.py` – single-image demos & ablations
 - `SingleDeformation.py` – one-off: heatmap + quivers + warped output (for figures)
-- `WARP_all_images_AUTO.py` – batch heatmaps/overlays/warps (parameterized filenames)
+- `WARP_all_images_AUTO.py` – batch heatmaps/overlays/warps (parameterized)
 
 **Whole-image classifier**
 - `whole_classifier_model.py` – image-level model (patch backbone + ResNet blocks + classifier head)
